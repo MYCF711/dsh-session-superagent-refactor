@@ -64,10 +64,22 @@ vm.runInContext(readFileSync(join(ROOT, 'client.js'), 'utf8'), sandbox)
 const mod = registrations[0]
 if (!mod) throw new Error('client.js 没有注册任何模块')
 const slots = new Map()
+const tabDefinitions = []
+const navigationCalls = { selectPanel: [], openTab: [] }
+const hostServices = {
+  layout: { selectPanel: (id) => { navigationCalls.selectPanel.push(id) } },
+  sidebarRight: { openTab: (...args) => { navigationCalls.openTab.push(args) } },
+  sidebarRightTabs: { register: (definition) => { tabDefinitions.push(definition); return () => {} } },
+  sessions: {
+    list: { getSnapshot: () => ({ phase: 'ready', byId: { s1: { title: '当前项目会话' }, s2: { title: '另一项目会话' } } }) },
+    refresh: async () => {},
+  },
+}
 const ctx = {
+  get: (name) => hostServices[name],
   slots: {
     inject: (_name, fn) => fn(),
-    register: (opts, Component) => { slots.set(opts.id, Component); return () => {} },
+    register: (opts, Component) => { slots.set(opts.name + '#' + (opts.id || opts.key), Component); return () => {} },
   },
   effect: (fn) => fn(),
 }
@@ -76,9 +88,19 @@ mod.factory((name) => {
   throw new Error('unexpected require: ' + name)
 }).apply(ctx)
 
-const Desk = slots.get('session-superagent-desk')
-const Orbit = slots.get('session-superagent-orbit')
-if (!Desk) throw new Error('没有注册 session-superagent-desk，已注册：' + [...slots.keys()].join(','))
+const Desk = slots.get('main#session-superagent')
+const SessionDesk = slots.get('sidebar.right.pane.tab#dsh-session-superagent/session')
+const HeaderUtility = slots.get('conversation.session.header.utilities#session-superagent-current')
+const Orbit = slots.get('conversation.composer.dock#session-superagent-orbit')
+if (!Desk || !SessionDesk || !HeaderUtility || !Orbit) {
+  throw new Error('全局页/会话右栏/头部/Dock 入口注册不完整，已注册：' + [...slots.keys()].join(','))
+}
+if ([...slots.keys()].some((key) => key.startsWith('conversation.view#'))) {
+  throw new Error('旧 conversation.view 中栏注册必须保持删除')
+}
+if (tabDefinitions.length !== 1 || tabDefinitions[0].kind !== 'sessionSuperagent') {
+  throw new Error('sidebarRightTabs definition 未按 sessionSuperagent 注册')
+}
 
 // ── 样本快照：覆盖各种状态（正常/暂停/异常/仅观察/隔离/退避/过滤记录/历史）──
 const now = Date.now()
@@ -312,10 +334,10 @@ const stalledSnapshot = {
   }),
 }
 
-// hook 槽顺序必须与 client.js 里 ZhuliPanel 的 useState 顺序完全一致：
+// hook 槽顺序必须与 client.js 里 SuperagentPage 的 useState 顺序完全一致：
 // snap, tab, notice, form, token, goalDraft, goalTouched, [], editing, draft, search,
 // glossary, update, checking, settingsSection
-const blankForm = { repo: '', intervalSec: '60', goal: '', labels: '', onlyAssigned: false, onlyNewComments: false, activeHours: '', isolated: false, workdir: '' }
+const blankForm = { repo: '', intervalSec: '60', goal: '', labels: '', onlyAssigned: false, onlyNewComments: false, activeHours: '', isolated: false, workdir: '', createSessionId: 's1' }
 const editKey = 'MYCF711/dsh-session-superagent#s1'
 const editDraft = {
   intervalSec: '60', labels: 'ai-fix', ignoreLabels: '', assignee: '', activeHours: '09:00-12:00,14:00-23:00',
@@ -324,8 +346,8 @@ const editDraft = {
   sessionMaxWakes: '', isolateKeepDays: '', maxIsolated: '', priorityReopened: true,
   priorityComments: true, priorityLabels: true, priorityUnassigned: false, priorityStale: false,
 }
-const editingHooks = (dirty = false) => {
-  const hooks = deskHooks({})
+const editingHooks = (dirty = false, snap = snapshot) => {
+  const hooks = deskHooks({ snap })
   hooks[8] = editKey
   hooks[9] = { ...editDraft, goal: dirty ? '修改后的目标' : editDraft.goal }
   return hooks
@@ -337,8 +359,8 @@ const deskHooks = ({ snap = snapshot, tab = 'overview', notice = null, glossary 
 
 const ONLY_NAME = (process.argv.find((a) => a.startsWith('--only=')) || '').slice('--only='.length)
 
-const modularHooks = ({ detail = false, confirm = false } = {}) => {
-  const hooks = deskHooks({ tab: 'modular' })
+const modularHooks = ({ detail = false, confirm = false, snap = snapshot } = {}) => {
+  const hooks = deskHooks({ tab: 'modular', snap })
   hooks[24] = 'all'
   hooks[25] = detail ? 'ticket:github:MYCF711/dsh-session-superagent#67' : null
   if (confirm) hooks[26] = true
@@ -383,11 +405,20 @@ const orbitWatchers = [
 ]
 
 const shown = ONLY_NAME ? scenarios.filter((s) => s.name.includes(ONLY_NAME)) : scenarios
-const sections = shown.map((scenario) => {
-  hookIndex = 0
-  const tree = Desk({ sessionId: 'preview-session' })
-  return '<h2 class="preview-title">' + scenario.name + '</h2>\n<div class="preview-frame">' + render(tree) + '</div>'
-}).join('\n')
+const sessionSnapshot = {
+  ...snapshot,
+  body: {
+    ...snapshot.body,
+    sessionTitle: '当前项目会话',
+    watchers: snapshot.body.watchers.filter((watcher) => watcher.sessionId === 's1'),
+  },
+}
+const sessionScenarios = [
+  { name: '会话右栏 · 模块化任务', hooks: modularHooks({ snap: sessionSnapshot }) },
+  { name: '会话右栏 · 行内编辑', hooks: editingHooks(false, sessionSnapshot) },
+  { name: '会话右栏 · 空态', hooks: deskHooks({ snap: emptySnapshot }) },
+]
+const sessionShown = ONLY_NAME ? sessionScenarios.filter((s) => s.name.includes(ONLY_NAME)) : sessionScenarios
 
 // 兜底 token：**必须用真名**（旧版这里写的是 --dsw-alias-border-default / success-500 / accent-primary，
 // 宿主机上根本没有这些名字，所以预览一直是"没上色"的假象）。浅色/深色两套，供离线看布局用。
@@ -433,9 +464,23 @@ const darkTokens = `
 const sectionsForTheme = shown.map((scenario) => {
   hookQueue = scenario.hooks
   hookIndex = 0
-  const tree = Desk({ sessionId: 'preview-session' })
+  const tree = Desk({})
   return '<h2 class="preview-title">' + scenario.name + '</h2>' + '<div class="preview-frame">' + render(tree) + '</div>'
 }).join('')
+
+const sessionSectionsForTheme = sessionShown.map((scenario) => {
+  hookQueue = scenario.hooks
+  hookIndex = 0
+  const tree = SessionDesk({ sessionId: 's1' })
+  return '<h2 class="preview-title">' + scenario.name + '</h2>' + '<div class="preview-frame">' + render(tree) + '</div>'
+}).join('')
+
+const headerSection = (() => {
+  hookQueue = [null, false]
+  hookIndex = 0
+  const tree = HeaderUtility({ sessionId: 's1' })
+  return '<h2 class="preview-title">会话头部入口</h2><div class="preview-frame">' + render(tree) + '</div>'
+})()
 
 const orbitSection = (() => {
   hookQueue = [orbitWatchers, true, { x: 200, y: 400 }]
@@ -457,7 +502,10 @@ const themePopover = (label, tokens) => '<section>'
 const themeBlock = (label, tokens) => '<section>'
   + '<h1 class="theme-name">' + label + '</h1>'
   + '<div class="themed" style="' + tokens.split(String.fromCharCode(10)).join(' ') + '">'
-  + (ONLY_NAME ? '' : orbitSection) + sectionsForTheme
+  + (ONLY_NAME ? '' : orbitSection)
+  + headerSection
+  + '<h2 class="preview-title">左侧全局中枢</h2>' + sectionsForTheme
+  + sessionSectionsForTheme
   + '</div></section>'
 
 
@@ -485,8 +533,8 @@ const html = '<!doctype html><meta charset="utf-8"><title>主理鱼面板预览�
   + (process.argv.includes('--outline') ? '.dt-page > * { outline: 1px dashed #f0f !important; }' : '')
   + '</style>'
   + (process.argv.includes('--measure') ? '<script>window.addEventListener("load", function () { var body = document.querySelectorAll(".dt-ticket-body")[0]; var rows = []; rows.push("body h" + Math.round(body.getBoundingClientRect().height)); Array.prototype.forEach.call(body.children, function (el) { var r = el.getBoundingClientRect(); rows.push((el.className.split(" ")[0] || el.tagName) + " h" + Math.round(r.height) + " " + (el.textContent || "").slice(0, 14)); }); var pre = document.createElement("pre"); pre.id = "measure"; pre.textContent = rows.join(" | "); document.body.insertBefore(pre, document.body.firstChild); });</script>' : '')
-  + '<div style="font:13px/1.5 system-ui;opacity:.75">主理鱼面板静态预览 —— 真实 client.js 渲染的 DOM + 移植的官方 CSS。'
-  + '兜底色值只是近似（真机以宿主注入的 --dsw-alias-* 为准），这里用来发现「某个主题下颜色写死或漏 token」。</div>'
+  + '<div style="font:13px/1.5 system-ui;opacity:.75">主理鱼最终导航静态预览（无旧 conversation.view 中栏）—— 真实 client.js 渲染的 DOM + 移植的官方 CSS。'
+  + '仅保留左侧全局中枢、会话右栏、头部入口与 Dock/Orbit；兜底色值只是近似（真机以宿主注入的 --dsw-alias-* 为准）。</div>'
   + (ONLY_POPOVER
     ? (process.argv.includes('--dark') ? themePopover('深色主题', darkTokens) : themePopover('浅色主题', lightTokens) + themePopover('深色主题', darkTokens))
     : (process.argv.includes('--dark') ? themeBlock('深色主题', darkTokens) : themeBlock('浅色主题', lightTokens) + themeBlock('深色主题', darkTokens)))
