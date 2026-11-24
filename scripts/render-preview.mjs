@@ -282,6 +282,26 @@ const errorSnapshot = {
   }),
 }
 
+/**
+ * 停摆态：`lastError` 为 null、但 `poll` 判 boot-miss / stalled。
+ * 这是最容易「面板绿灯但实际不干活」的形态（2026-11-22 真机：重启后 24 小时零轮询，
+ * 面板照旧「运行中 · 正常」）。本场景专门用来出图验证：「需要关注」区块有没有把它列出来、
+ * 主行有没有画成「异常」。PR #1 原有这个场景，backport 时漏了，补回。
+ */
+const stalledSnapshot = {
+  loading: false, error: null,
+  body: baseBody({
+    sessionTitle: '无头联调会话',
+    credentials: { token: 'configured', sshKeyPath: 'none' },
+    watchers: [baseWatcher({
+      title: '无头联调会话',
+      enabled: true,
+      lastPoll: iso(2 * 3600000),
+      poll: 'boot-miss',
+    })],
+  }),
+}
+
 /** 暂停态：enabled=false + 时段外暂停（lastDeferred 有值）。看暂停原因是否一眼可读。 */
 const pausedSnapshot = {
   loading: false, error: null,
@@ -360,6 +380,7 @@ const scenarios = [
   { name: '空态（无守）', hooks: deskHooks({ snap: emptySnapshot }) },
   { name: '错误态（守失败）', hooks: deskHooks({ snap: errorSnapshot }) },
   { name: '暂停态（已停用）', hooks: deskHooks({ snap: pausedSnapshot }) },
+  { name: '轮询停摆（headless）', hooks: deskHooks({ snap: stalledSnapshot }) },
   { name: '读取失败', hooks: [{ loading: false, error: 'Failed to fetch', body: null }, 'overview', null, blankForm, '', '', false, [], null, {}, '', false, null, false, 'source', null, null] },
 ]
 

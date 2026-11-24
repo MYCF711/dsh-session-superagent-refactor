@@ -4,6 +4,55 @@
 
 ## [Unreleased]
 
+### Fixed —— 未 inject 的服务被直接读取，整轮轮询抛错
+
+- **助理鱼抛 `cannot get property "admissionGate" without inject` 后，PR 几个小时唤不醒**（2026-11-24 真机：面板红「异常」、`已连续失败 1 次 · 等待重试`，PR #153 漏掉数小时）。
+  根因在 `filterAdmissionBatch()`（`lib/index.js`）：它写的是
+  `deps.admissionGate || ctx && ctx.admissionGate || (() => 'accept')`。`ctx` 是 cordis 的 Proxy，
+  凡**未在 `export const inject` 里声明**的属性，读取时**直接抛**而不是返回 `undefined`，
+  所以 `||` 的短路根本救不了 —— 左侧求值就抛了。该函数在**唤醒主路径**上，`tick` 的 `catch`
+  把异常写进 `lastError` 并 `bumpFailure`，于是每轮都在真正唤醒之前失败，形成
+  「抛错 → 退避 → 再抛错」的死循环：守看着还在跑、面板也显示轮询正常，但永远不会唤醒。
+  - 修法：新增 `optionalService(ctx, name)`，走 `ctx.get(name)`（对未 inject 的服务返回 `undefined`）
+    并对直接属性读取加 `try`，统一按「缺失」兜底。
+  - 同一判据的另两处一起改：`buildModularProjection()` 的 `!ctx.sessionController` 与
+    `recordRuntimeDelivery()` 的 `ctx.sessionController ? … : undefined` —— 两者都在 `inject` 之外，
+    worker 模式下必然抛。
+  - **第四处漏网**（`lib/rooms/executor-host.js` 的 `requireHost` 写 `ctx[name]`）：与上面读取语义
+    不一致，会出现「登记阶段用宽容的 `ctx.get()` 取到、投递阶段用直接属性读取抛错」，状态里留下
+    一个 `worker-* / status: assigned` 却从未被执行的 assignment。现统一读取方式，并给出明确的
+    `DSH host capability missing: <name>` 而不是泄漏底层 inject 报错。
+  - 用例 `test/admission-inject.test.mjs`（12 条）**用真实 cordis Context + 真实插件 fiber** 复现，
+    而不是手写 Proxy —— 抛错分支要求 `defSite.fiber.runtime` 存在（即插件作用域内），根 ctx 上访问
+    反而返回 `undefined`，手写 Proxy 的用例在真实宿主里不成立。第 1 条专门钉住这个前提
+    （未 inject 的读取必须抛），前提将来失效时用例自己会红，而不是悄悄变成永远通过。
+    取不到 cordis 时**退化成等价的最小 Proxy 而不是 SKIP** —— 实测在干净目录下会 3/5 SKIP，
+    而 preflight 只判 `fail === '0'`，等于 CI 全绿但零覆盖。
+
+### Fixed —— 两轮审计（常规 + 对抗性）后的补充
+
+- **门禁兜底不能一刀切**（两轮审计互相矛盾的点，而两条都成立）：对抗性审计指出 `() => 'accept'`
+  是 fail-open（本该拒绝的 PR 会被放行）；常规审计指出 **DSH 全仓没有任何包 `provide('admissionGate')`**，
+  改成 `unknown` 会让 `filterAdmissionBatch` 永远返回空 → **一条 PR 都唤不醒**，比原 bug 更隐蔽。
+  现在按「刚才是怎么没取到的」分两路：宿主**本就没有**该服务（`ctx.get` 返回 undefined 且无异常）
+  → 放行；**有但读失败**（服务正在释放 / fiber 不活跃，记了 miss）→ fail-closed，并把降级写进
+  `lastAdmissionDegraded` 供面板 / doctor 曝出。双向变异验证：一律 accept → 用例 4 红；
+  一律 unknown → 用例 3 红。
+- **`nextAt` 指向远期时永久绿灯**（对抗性审计）：`pollHealth` 只要 `nextAt > now` 就判 `waiting`，
+  而 `tick` 无条件早退 —— 手改 `watchers.json` 或时钟前跳会造出「面板绿灯、永不唤醒」。
+  新增 `MAX_SANE_BACKOFF_MS`（按代码路径真能写出的最大值派生，不是拍脑袋），超过就按 `stalled` 报出。
+- **缺失诊断被丢掉**：`optionalService` 原本把「宿主没这个服务」与「有但读不到」都吞成同一个
+  `undefined`，而 cordis 对这两种情况编的是**不同 message**。现在按服务名分别记录，
+  并区分预期路径（未 inject）与真故障。
+- **`summarizeByRepo` 两处漂移**：`lib/watch.js` 只判 `lastError` 未计 `poll`，而 `client.js` 的同名
+  函数已计 —— 面板可见面是对的，但 lib 侧这份被 `watch.test` 断言。现统一判据。
+- **补回 PR #1 的「轮询停摆」预览场景**（`scripts/render-preview.mjs` 的 `stalledSnapshot`）：
+  backport 时漏了这个出图场景，导致「面板绿灯但实际不干活」这个最容易误判的形态没有视觉证据。
+- **两处修复此前零测试覆盖**：`buildModularProjection` / `executor-host` 的改动没有任何用例守护，
+  把它们改回直接属性读取时全部用例仍绿（变异实测）。已各自补一条针对性用例。
+  用例里也有一个假绿被修掉：原「门禁抛错必须 fail-closed」在 gate 与 assessment **都**失败时，
+  无论 fail-open 还是 fail-closed 都返回空，无法区分 —— 现在只让 gate 失败、assessment 正常。
+
 ## [1.1.0] - 2026-11-22 —— 模块化房间与单用户执行（实验候选）
 
 ### Added —— 模块化房间（独立实验仓）
@@ -14,6 +63,47 @@
 - **持久化 Outbox**：同 Ticket FIFO、CAS 冲突重试、attempts 栅栏、失败退避、崩溃恢复；worker prompt 使用稳定 messageId，GitHub/Gitee 评论带不可见 marker 并在重试前查重。
 - **Admission / Source / 视图**：确定性 gate 先行、assessment 不得推翻拒绝；provider registry 接入真实 ack；Ticket records、执行、健康、Outbox、草稿与 zh/en 提示词接入 `/state` 和面板。
 - **模块化路由**：新增 `/tickets`、`/outbox`、`/draft`，总路由 16 条；写操作统一 `guardWrite` 与模块化 CAS，`/state` 区分未知 `null` 与显式空集合 `0`。
+### Fixed —— backport 自 PR #68（启动挂载 / 健康判据）
+
+- **`pollHealth` 的五个交界问题**（PR #68 review 第二轮，每条都有独立最小复现）：
+
+  1. **启动豁免被 `createdAt < bootAt` 绕过**：`lastPoll=null` 时只要守建于进程启动前就立刻判 `boot-miss`，
+     哪怕进程才起来 60 秒。现在该分支也要求 `uptimeMs > staleMs`，否则给 `grace` ——
+     「刚重启还没轮到」和「bootstrap 真的失败」是两件事。
+  2. **会话宽限期不算正常等待**：PR 守写 `deferReason: 'session-missing'`，但 `pollHealth` 只认
+     activeHours / backoff / cap，于是「会话缺失 1 分钟、退避正常」仍被判 `stalled`、面板照旧显示「轮询停了」。
+     现在 `session-missing` 归 `waiting`；issue 守那一侧也补上了 `deferReason`（以前只有 PR 守写，两处不对称）。
+  3. **按仓库汇总仍是绿点**：`summarizeByRepo()` 只在 `lastError` 时加 `errors`，没计 `poll` ——
+     主行已经红了、底部汇总还是绿点。服务端与面板两份实现一起改。
+  4. **`watch_status` 对暂停别名仍投影 `enabled: true`**：`projectWatcher()` 写的是 `enabled !== false`，
+     于是 `statusView([{enabled:'off'}])` 返回 `enabled: true`，而同一个条目的 `pollHealth` 判 `paused`。
+     同一份公开 JSON 里两个结论打架。判据抽到 `lib/enabled.js` 的 `isWatcherEnabled()`，
+     调度器 / `pollHealth` / 投影房 / 面板 / `summarizeByRepo` / 「在跑的守」计数全部共用。
+  5. **只有停摆时「需要关注」是空的**：`hasProblem()` 认了 `poll`，但 `problems` 数组没加对应项 ——
+     筛选能选中它、顶部告警区却一条不显示（停摆时 `lastError` 本来就是 null，走不到那条分支）。
+     现在 `poll` 有独立告警项，rank 0（比任何 `lastError` 都该先看），文案按 `stalled` / `boot-miss` 分开。
+
+  6. **陈旧的 `deferReason` 会永久压掉真实停摆**（对抗性审计打穿的真实回归）：上面第 2 条最初写成
+     「`deferReason === 'session-missing'` 就无条件 `waiting`」，于是一个真实事故形态被重新藏起来 ——
+     会话休眠时写下 `session-missing`，宿主重启后启动挂载又没跑起来，面板绿灯、doctor 同一份数据
+     却报「重启后还没轮询过」。`cap-*` 同病。现在：① `beforeBoot && uptimeMs > staleMs`（重启后
+     一次都没成功轮询）优先于任何运行时理由，直接 `boot-miss`；② `cap-*` / `session-missing` 只有
+     在 `lastPoll` 新鲜（`ageMs <= staleMs`）时才算等待 —— 它们与 `lastPoll` 本来就是同一轮成对落盘，
+     陈旧组合只可能是停摆后的残留；③ `session-missing` 另需 10 分钟宽限期真的没过。
+     `activeHours` 与 `nextAt` 不受此限：前者是配置、后者是绝对时间戳，本来就能独立解释停摆。
+  7. **issue 守的宽限期与 PR 守不对称**：补 `lastError = null` / `consecutiveFailures = 0` / `noteEvent`，
+     否则上一轮的故障痕迹会让「会话尚未就绪」这个正常状态仍亮红。
+
+  用例 15 条，全部做过变异验证（删 problems 里的 poll 项 / 汇总不看 poll / 暂停别名退回 `=== false` /
+  汇总圆点恒 `done` / 主行 `poll` 判成 `active` / `hasProblem` 删掉 poll / poll 告警 rank 0→99 /
+  面板「启用 N」回退 / `countPausable` 回退 / 去掉 `uptimeMs > staleMs` / 不认 `session-missing` /
+  `session-missing` 不校验新鲜度 / 删 `beforeBoot` 提前判定 / 投影退回 `enabled !== false`）——
+  14 种变异分别红在对应断言上，还原后全绿。
+
+- **PR 守把「会话暂时不在宿主里」直接当成故障**（2026-11-23 真机：`pr:MYCF711/dsh-session-superagent` 那条主理鱼所在会话只是**休眠**，面板里还在、标题正常，但宿主重启后 `agents.get()` 拿不到它）。issue 守有 `sessionMissingVerdict` 的 10 分钟宽限期，**PR 守没有**：它把 wake 的 reason 直接写成 `lastError` 并 `bumpFailure`，面板立刻显示红色「异常」+「退避 459s」，用户以为守坏了、不敢继续监控。现在 PR 守与 issue 守共用同一套判据：宽限期内记为「会话尚未就绪（宿主可能刚启动）」并**不累计失败**，超过宽限期才升级成「会话已不在」。两句共用 `sessionMissingDeferText()`，不再复制粘贴。用例：PR 守首轮宽限（`lastError` 必须为 null、`nextAt` 必须为 null、必须记下 `sessionMissingSince`）+ 反向用例（超过宽限期必须真的报错并进退避）。
+- **宿主重启后，所有守一次都不再轮询**（2026-11-22 真机：11-21 23:11 重启，之后 24 小时零轮询，`lastError` 仍是 null，面板照旧「运行中 · 正常」，期间新建的 PR 全部漏掉）。根因在 `apply()` 的启动挂载段：`for (const entry of …) startWatcher(state.watchers[id])` —— 循环变量叫 `entry`，`id` 在该作用域根本不存在，于是每轮都 `startWatcher(undefined)`，在 `timers.has(entry.id)` 处抛 `TypeError`，被外层空 `catch {}` 吞掉，**一条守也挂不上且没有任何报错**。现在改用 `entry` 本身，并让单条守的挂载失败不连累其余守（失败原因写进该条的 `lastError`）。用例：预置含 enabled/paused 的 `watchers.json`，重新 `import` 并 `apply()` 后断言 enabled 的有 interval 定时器、paused 的没有。
+- **「重启后一次都没轮询」此前不可观测**。新增 `pollHealth()` 纯函数（`lib/watch.js`）作为面板 / `/state` / `watch_doctor` 的单一判据：`boot-miss`（`lastPoll` 早于本进程诞生且已过豁免期）、`stalled`（跑着跑着丢了）、`grace`（刚重启还没轮到）、`ok` / `never` / `paused`。doctor 现在会明确说「重启后还没轮询过 —— 启动挂载可能失败」，而不是误报成「定时器可能丢了」；判据以**真实进程诞生时刻**为准 —— 盘上的 `server.startedAt` 在启动挂载失败时根本不刷新（现场差了 24 小时），读它会把故障当成「刚重启」。
+- `/state` 与面板对停摆的守给提示（`boot-miss` 显示「重启后没跑起来」、`stalled` 显示「轮询停了」）。该字段是**可选**的：健康态整个字段不出现（缺省即健康），因为 20 条守的 `/state` 只剩约 0.5 KB 余量（preflight「面板请求体积」50 KB）；契约清单新增 `optional` 级别表达这类「只在特定状态出现、出现时名字固定」的字段。
 
 ## [1.0.0] - 2026-11-21 —— 水位 v2 与最小交付房间
 
