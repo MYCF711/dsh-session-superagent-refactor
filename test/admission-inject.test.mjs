@@ -6,6 +6,7 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
 import { __test } from '../lib/index.js'
+import { MAX_SANE_BACKOFF_MS, pollHealth } from '../lib/watch.js'
 
 const { filterAdmissionBatch, optionalService } = __test
 
@@ -69,10 +70,17 @@ function loadCordis() {
   return cordisPromise
 }
 
-/** 造一个真实的、带 fiber 的插件 context，让未 inject 的访问真的抛。 */
+/**
+ * 造一个真实的、带 fiber 的插件 context，让未 inject 的访问真的抛。
+ *
+ * 拿不到 cordis 时**不跳过**，退化成等价的最小实现（见 fallbackPluginContext）。
+ * 原因：对抗性审计实测，在干净目录（≈ CI）下 5 条里有 3 条 SKIP，而这 3 条正是
+ * 本提交全部的核心回归 —— 剩下 2 条是纯函数、在**修复前的代码上也全绿**。
+ * 也就是说 SKIP 会让本文件在 CI 上「通过」但实际零覆盖，是标准假绿。
+ */
 async function withPluginContext(fn) {
   const cordis = await loadCordis()
-  if (!cordis) return { skipped: true }
+  if (!cordis) return { skipped: false, value: await fallbackPluginContext(fn) }
   const { Context, Service } = cordis
   class Tools extends Service { constructor(ctx) { super(ctx, 'tools') } }
   const root = new Context()
@@ -91,6 +99,26 @@ async function withPluginContext(fn) {
   })
   if (box.error) throw box.error
   return { skipped: false, value: box.value }
+}
+
+/**
+ * 无 cordis 时的等价实现：只复刻 `ReflectService.handler.get` 中**与本用例相关**的语义。
+ *
+ * 为什么这就够：本文件要验证的是「未 inject 的属性读取会抛，而 optionalService 必须
+ * 把它归为缺失」，这**不需要**真 cordis —— 需要的是「读未声明属性 → 抛」这一条。
+ * （真实 cordis 里该分支要求 `defSite.fiber.runtime` 存在，即插件作用域内；根 ctx
+ * 反而不抛。这里直接构造插件作用域的行为。）
+ */
+async function fallbackPluginContext(fn) {
+  const DECLARED = new Set(['tools'])
+  const ctx = new Proxy({ tools: { register() {} }, get: (name) => undefined }, {
+    get(target, prop, receiver) {
+      if (prop === 'then' || typeof prop === 'symbol') return Reflect.get(target, prop, receiver)
+      if (Reflect.has(target, prop) || DECLARED.has(prop)) return Reflect.get(target, prop, receiver)
+      throw new Error(`cannot get property "${String(prop)}" without inject`)
+    },
+  })
+  return fn(ctx, {})
 }
 
 test('未 inject 的服务：真实插件 fiber 里直接读必然抛（钉住前提，防止用例失去意义）', async (t) => {
@@ -122,7 +150,24 @@ test('optionalService：未 inject 返回 undefined，不抛', async (t) => {
   assert.equal(out.value.nullsafe, undefined, 'ctx 为 null 时也不能抛')
 })
 
-test('filterAdmissionBatch：未 inject gate 时走 accept 兜底，整批放行（真机回归）', async (t) => {
+/**
+ * 反向用例（对抗性审计 P0-2 指出的假绿点）。
+ *
+ * 原先这条断言的是「未 inject 门禁时必须放行 [153,154]」—— 但那条断言在**两种完全
+ * 相反的实现**下都成立：真实现（ctx.get → undefined → 兜底）和假实现（optionalService
+ * 永远 return undefined）。变异实测 M4/M5：把 ctx 路径改成永远放行、或让
+ * optionalService 永远返回 undefined，5 条用例**全部仍绿**。用例钉住的是「放行」这个
+ * 现象，没钉住「为什么可以放行」这个语义 —— 正是 AGENTS.md 坑 #7 的同类。
+ *
+ * **修正（两轮审计互相矛盾的裁决点）**：
+ * 对抗性审计说「兜底 accept = fail-open，该拒绝的被放行」，常规审计说「DSH 全仓没有任何包
+ * provide 门禁，改成 unknown 会永不唤醒」。**两条都成立**，所以不能二选一 ——
+ * 判据必须看「刚才那次读取到底发生了什么」：
+ *   ① 宿主从未提供门禁（ctx.get 返回 undefined 且无异常）→ **放行**（否则一条都唤不醒）
+ *   ② 门禁存在但读取失败（记录了 miss）→ **fail-closed 且可见**
+ * 下面三条用例分别钉住 ①②，以及「②不能退化成①」。
+ */
+test('filterAdmissionBatch：宿主本就没有门禁时必须放行（否则永不唤醒）', async (t) => {
   const out = await withPluginContext(async (ctx) => {
     const items = [{ number: 153 }, { number: 154 }]
     return {
@@ -131,9 +176,56 @@ test('filterAdmissionBatch：未 inject gate 时走 accept 兜底，整批放行
     }
   })
   if (out.skipped) return t.skip('本机没有可用的 cordis')
-  // 修复前：这里抛 `cannot get property "admissionGate" without inject`，一条也放行不了
-  assert.deepEqual(out.value.accepted.map((i) => i.number), [153, 154], '未注入门禁时必须回退放行，而不是抛错')
-  assert.deepEqual(out.value.acceptedNoDeps.map((i) => i.number), [153, 154], 'deps 省略时同样不能抛')
+  // 真实插件的 ctx.admissionGate 会抛，但 optionalService 先走 ctx.get 拿到 undefined、
+  // 且**没有记录任何 miss** → 判定为「宿主本就没有」，必须放行。
+  assert.deepEqual(out.value.accepted.map((i) => i.number), [153, 154], '宿主无门禁时必须放行，而不是抛错或永远不唤醒')
+  assert.deepEqual(out.value.acceptedNoDeps.map((i) => i.number), [153, 154], 'deps 省略时同样要放行')
+})
+
+test('filterAdmissionBatch：门禁读取失败时必须 fail-closed 且可见（真机形态：服务正在释放）', async () => {
+  const { getAdmissionDegraded } = __test
+  // 关键：**只让 gate 读失败、让 assessment 正常**。两个都失败的话，无论 fail-open
+  // 还是 fail-closed 最终都返回空，「一律 accept」的变异实测也全绿（假绿）——
+  // 只有 assessment 可用时，accept 才会真的走下去并放行，才能区分两种实现。
+  const releasing = {
+    get(name) {
+      if (name === 'admissionGate') throw new Error('cannot get required service "admissionGate" in inactive context')
+      if (name === 'admissionAssessment') return () => 'accept'
+      return undefined
+    },
+  }
+  const accepted = await filterAdmissionBatch(releasing, [{ number: 153 }], {})
+  assert.deepEqual(accepted, [], '门禁存在但读不到时不得放行，否则等于静默关闭准入')
+  assert.ok(getAdmissionDegraded(), '降级必须留痕，否则「为什么没唤醒」无从诊断')
+  assert.equal(getAdmissionDegraded().gate.name, 'admissionGate')
+})
+
+test('filterAdmissionBatch：门禁返回 unknown / reject 一律不放行（判据本身）', async () => {
+  const items = [{ number: 1 }, { number: 2 }]
+  for (const verdict of ['unknown', 'reject']) {
+    const accepted = await filterAdmissionBatch({ get: () => undefined }, items, {
+      admissionGate: () => verdict,
+      admissionAssessment: () => 'accept',
+    })
+    assert.deepEqual(accepted, [], `门禁 ${verdict} 必须不放行，不能被 assessment 翻案`)
+  }
+})
+
+test('filterAdmissionBatch：无门禁时不得留下降级记录（防止 ② 退化成 ①）', async () => {
+  const { getAdmissionDegraded } = __test
+  await filterAdmissionBatch({ get: () => undefined }, [{ number: 1 }], {})
+  assert.equal(getAdmissionDegraded(), null, '正常放行不该被记成降级')
+})
+
+test('可选服务读取失败必须留痕，不能无声吞掉（审计 P1-1）', () => {
+  const { getOptionalServiceMiss } = __test
+  const before = getOptionalServiceMiss()
+  const releasing = { get() { throw new Error('cannot get required service "x" in inactive context') } }
+  assert.equal(optionalService(releasing, 'admissionGate'), undefined)
+  const after = getOptionalServiceMiss()
+  assert.notDeepEqual(after, before, '真实读取失败必须被记录，否则故障不可诊断')
+  assert.equal(after.name, 'admissionGate')
+  assert.match(after.text, /inactive context/)
 })
 
 test('filterAdmissionBatch：显式 deps 优先于 ctx，且能真的拒绝', async () => {
@@ -150,4 +242,67 @@ test('filterAdmissionBatch：显式 deps 优先于 ctx，且能真的拒绝', as
 test('optionalService：ctx.get 抛异常时仍按缺失处理，不外泄', () => {
   const hostile = { get() { throw new Error('boom') } }
   assert.equal(optionalService(hostile, 'admissionGate'), undefined)
+})
+
+/**
+ * 审计 P2-1：`nextAt` 指向远期时，旧实现判 `waiting`（绿灯）且 `tick` 无条件早退 ——
+ * 「永久 waiting + 永不报故障」，与本次母问题同形（面板绿灯、实际永远不唤醒）。
+ * 代码路径写不出远期值，但 `watchers.json` 是人也会手改的文件（见 lib/enabled.js 的注释）。
+ */
+test('pollHealth：nextAt 指向远期不得永久绿灯，必须按停摆报出来（审计 P2-1）', () => {
+  const now = Date.parse('2026-11-24T10:00:00Z')
+  const bootAt = now - 24 * 60 * 60 * 1000
+  const base = { enabled: true, intervalSec: 60, lastPoll: new Date(now).toISOString() }
+
+  // 正常退避（分钟级）仍是正常等待
+  assert.equal(pollHealth({ ...base, nextAt: new Date(now + 5 * 60 * 1000).toISOString() }, { now, bootAt }).state, 'waiting')
+  // 一年后：手改 / 时钟异常 → 必须报停摆，不能绿
+  const far = pollHealth({ ...base, nextAt: new Date(now + 365 * 86400000).toISOString() }, { now, bootAt })
+  assert.equal(far.state, 'stalled', '远期的 nextAt 必须报停摆，而不是永久 waiting')
+  // 边界：恰好越过上限才判停摆
+  assert.equal(pollHealth({ ...base, nextAt: new Date(now + MAX_SANE_BACKOFF_MS).toISOString() }, { now, bootAt }).state, 'waiting')
+  assert.equal(pollHealth({ ...base, nextAt: new Date(now + MAX_SANE_BACKOFF_MS + 1000).toISOString() }, { now, bootAt }).state, 'stalled')
+})
+
+/**
+ * 常规审计 D 节：提交说明声称「另外两处一起改」，但**没有任何用例守护**。
+ * 变异实测 M3/M4：把这两处改回 `ctx.sessionController` 直接读，全部用例仍绿 —— 零覆盖。
+ * 下面两条补上，并用真实 cordis 语义（未 inject 读取会抛）驱动。
+ */
+test('buildModularProjection：worker 活跃但读不到 sessionController 时必须降级为 paused，不能抛（覆盖 buildModularProjection）', async (t) => {
+  const out = await withPluginContext((ctx) => {
+    const { buildModularProjection } = __test
+    const state = {
+      tickets: { 'ticket:github:a/b#1': { id: 'ticket:github:a/b#1', status: 'assigned' } },
+      assignments: { 'ticket:github:a/b#1': { sessionId: 'worker-ticket:github:a/b#1', status: 'assigned' } },
+      outbox: [],
+    }
+    return buildModularProjection(state, ctx)
+  })
+  if (out.skipped) return t.skip('本机没有可用的 cordis')
+  // 修复前：`!ctx.sessionController` 在真实插件 fiber 里直接抛 cannot get property
+  // 注意 health 挂在 deployment 下（不是 execution），按真实结构断言
+  const health = (out.value.deployment.health || []).find((h) => h.name === 'executor')
+  assert.ok(health, 'executor 的 health 必须存在')
+  assert.equal(health.state, 'paused', 'worker 活跃但宿主能力不可用时必须显式 paused')
+  assert.equal(health.detail, 'sessionController unavailable for worker')
+  assert.equal(out.value.execution.paused, true, '执行必须被标记暂停，而不是假装就绪')
+})
+
+test('createDshExecutor：未 inject 的宿主服务要报明确的 capability missing，不能抛 inject 错（覆盖 executor-host）', async (t) => {
+  const out = await withPluginContext(async (ctx) => {
+    const { createDshExecutor } = __test
+    const executor = createDshExecutor(ctx)
+    try {
+      await executor.start({ ticket: { id: 'ticket:github:a/b#1', workdir: 'C:/tmp/x' }, assignment: {} })
+      return { threw: null }
+    } catch (error) {
+      return { threw: String(error && error.message || error) }
+    }
+  })
+  if (out.skipped) return t.skip('本机没有可用的 cordis')
+  // 修复前：requireHost 用 `ctx[name]` 直接读 → 抛 `cannot get property "sessionController" without inject`
+  assert.match(out.value.threw || '', /DSH host capability missing: sessionController/,
+    '必须是明确的「能力缺失」，而不是底层的 inject 报错')
+  assert.doesNotMatch(out.value.threw || '', /without inject/, '不得把底层 cordis 报错泄漏给调用方')
 })

@@ -6,11 +6,52 @@
 
 ### Fixed —— 未 inject 的服务被直接读取，整轮轮询抛错
 
-- **助理鱼抛 `cannot get property "admissionGate" without inject` 后，PR 几个小时唤不醒**（2026-11-24 真机：面板红「异常」、`已连续失败 1 次 · 等待重试`，PR #153 漏掉数小时）。根因在 `filterAdmissionBatch()`（`lib/index.js`）：它写的是 `deps.admissionGate || ctx && ctx.admissionGate || (() => 'accept')`。`ctx` 是 cordis 的 Proxy，凡**未在 `export const inject` 里声明**的属性，读取时**直接抛**而不是返回 `undefined`，所以 `||` 的短路根本救不了 —— 左侧求值就抛了。该函数在**唤醒主路径**上，`tick` 的 `catch` 把异常写进 `lastError` 并 `bumpFailure`，于是每轮都在真正唤醒之前就失败，形成「抛错 → 退避 → 再抛错」的死循环。
-  - 修法：新增 `optionalService(ctx, name)`，走 `ctx.get(name)`（对未 inject 的服务返回 `undefined`）并对直接属性读取加 `try`，统一按「缺失」兜底。
-  - 同一判据的另外两处一起改：`buildModularProjection()` 的 `!ctx.sessionController` 与 `recordRuntimeDelivery()` 的 `ctx.sessionController ? … : undefined` —— 两者都在 `inject` 之外，worker 模式下必然抛。
-  - 用例 `test/admission-inject.test.mjs`（5 条）：**用真实 cordis Context + 真实插件 fiber** 复现，而不是手写 Proxy —— 抛错分支要求 `defSite.fiber.runtime` 存在（即插件作用域内），根 ctx 上访问反而返回 `undefined`，手写 Proxy 的用例在真实宿主里不成立。第 1 条专门钉住这个前提（未 inject 的读取必须抛），前提失效时用例自己会红，而不是变成永远通过。
-  - 变异验证：退回 `ctx.admissionGate` 原写法 → 用例 3 红，报错文本与真机逐字一致（`cannot get property "admissionGate" without inject`）；把 `optionalService` 的 `try` 去掉 → 4 条红。还原后 5/5 全绿。
+- **助理鱼抛 `cannot get property "admissionGate" without inject` 后，PR 几个小时唤不醒**（2026-11-24 真机：面板红「异常」、`已连续失败 1 次 · 等待重试`，PR #153 漏掉数小时）。
+  根因在 `filterAdmissionBatch()`（`lib/index.js`）：它写的是
+  `deps.admissionGate || ctx && ctx.admissionGate || (() => 'accept')`。`ctx` 是 cordis 的 Proxy，
+  凡**未在 `export const inject` 里声明**的属性，读取时**直接抛**而不是返回 `undefined`，
+  所以 `||` 的短路根本救不了 —— 左侧求值就抛了。该函数在**唤醒主路径**上，`tick` 的 `catch`
+  把异常写进 `lastError` 并 `bumpFailure`，于是每轮都在真正唤醒之前失败，形成
+  「抛错 → 退避 → 再抛错」的死循环：守看着还在跑、面板也显示轮询正常，但永远不会唤醒。
+  - 修法：新增 `optionalService(ctx, name)`，走 `ctx.get(name)`（对未 inject 的服务返回 `undefined`）
+    并对直接属性读取加 `try`，统一按「缺失」兜底。
+  - 同一判据的另两处一起改：`buildModularProjection()` 的 `!ctx.sessionController` 与
+    `recordRuntimeDelivery()` 的 `ctx.sessionController ? … : undefined` —— 两者都在 `inject` 之外，
+    worker 模式下必然抛。
+  - **第四处漏网**（`lib/rooms/executor-host.js` 的 `requireHost` 写 `ctx[name]`）：与上面读取语义
+    不一致，会出现「登记阶段用宽容的 `ctx.get()` 取到、投递阶段用直接属性读取抛错」，状态里留下
+    一个 `worker-* / status: assigned` 却从未被执行的 assignment。现统一读取方式，并给出明确的
+    `DSH host capability missing: <name>` 而不是泄漏底层 inject 报错。
+  - 用例 `test/admission-inject.test.mjs`（12 条）**用真实 cordis Context + 真实插件 fiber** 复现，
+    而不是手写 Proxy —— 抛错分支要求 `defSite.fiber.runtime` 存在（即插件作用域内），根 ctx 上访问
+    反而返回 `undefined`，手写 Proxy 的用例在真实宿主里不成立。第 1 条专门钉住这个前提
+    （未 inject 的读取必须抛），前提将来失效时用例自己会红，而不是悄悄变成永远通过。
+    取不到 cordis 时**退化成等价的最小 Proxy 而不是 SKIP** —— 实测在干净目录下会 3/5 SKIP，
+    而 preflight 只判 `fail === '0'`，等于 CI 全绿但零覆盖。
+
+### Fixed —— 两轮审计（常规 + 对抗性）后的补充
+
+- **门禁兜底不能一刀切**（两轮审计互相矛盾的点，而两条都成立）：对抗性审计指出 `() => 'accept'`
+  是 fail-open（本该拒绝的 PR 会被放行）；常规审计指出 **DSH 全仓没有任何包 `provide('admissionGate')`**，
+  改成 `unknown` 会让 `filterAdmissionBatch` 永远返回空 → **一条 PR 都唤不醒**，比原 bug 更隐蔽。
+  现在按「刚才是怎么没取到的」分两路：宿主**本就没有**该服务（`ctx.get` 返回 undefined 且无异常）
+  → 放行；**有但读失败**（服务正在释放 / fiber 不活跃，记了 miss）→ fail-closed，并把降级写进
+  `lastAdmissionDegraded` 供面板 / doctor 曝出。双向变异验证：一律 accept → 用例 4 红；
+  一律 unknown → 用例 3 红。
+- **`nextAt` 指向远期时永久绿灯**（对抗性审计）：`pollHealth` 只要 `nextAt > now` 就判 `waiting`，
+  而 `tick` 无条件早退 —— 手改 `watchers.json` 或时钟前跳会造出「面板绿灯、永不唤醒」。
+  新增 `MAX_SANE_BACKOFF_MS`（按代码路径真能写出的最大值派生，不是拍脑袋），超过就按 `stalled` 报出。
+- **缺失诊断被丢掉**：`optionalService` 原本把「宿主没这个服务」与「有但读不到」都吞成同一个
+  `undefined`，而 cordis 对这两种情况编的是**不同 message**。现在按服务名分别记录，
+  并区分预期路径（未 inject）与真故障。
+- **`summarizeByRepo` 两处漂移**：`lib/watch.js` 只判 `lastError` 未计 `poll`，而 `client.js` 的同名
+  函数已计 —— 面板可见面是对的，但 lib 侧这份被 `watch.test` 断言。现统一判据。
+- **补回 PR #1 的「轮询停摆」预览场景**（`scripts/render-preview.mjs` 的 `stalledSnapshot`）：
+  backport 时漏了这个出图场景，导致「面板绿灯但实际不干活」这个最容易误判的形态没有视觉证据。
+- **两处修复此前零测试覆盖**：`buildModularProjection` / `executor-host` 的改动没有任何用例守护，
+  把它们改回直接属性读取时全部用例仍绿（变异实测）。已各自补一条针对性用例。
+  用例里也有一个假绿被修掉：原「门禁抛错必须 fail-closed」在 gate 与 assessment **都**失败时，
+  无论 fail-open 还是 fail-closed 都返回空，无法区分 —— 现在只让 gate 失败、assessment 正常。
 
 ## [1.1.0] - 2026-11-22 —— 模块化房间与单用户执行（实验候选）
 
