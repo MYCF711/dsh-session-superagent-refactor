@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
+import { tmpdir } from 'node:os'
+import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { __test } from '../lib/index.js'
@@ -294,7 +296,10 @@ test('createDshExecutor：未 inject 的宿主服务要报明确的 capability m
     const { createDshExecutor } = __test
     const executor = createDshExecutor(ctx)
     try {
-      await executor.start({ ticket: { id: 'ticket:github:a/b#1', workdir: 'C:/tmp/x' }, assignment: {} })
+      // workdir 必须用平台无关的绝对路径：写死 'C:/tmp/x' 在 Linux CI 上
+      // 过不了 isAbsolute()，会先抛「executor workdir must be absolute」，
+      // 把本用例真正想验证的「capability missing」盖掉（CI 首次就是这么红的）。
+      await executor.start({ ticket: { id: 'ticket:github:a/b#1', workdir: resolve(tmpdir()) }, assignment: {} })
       return { threw: null }
     } catch (error) {
       return { threw: String(error && error.message || error) }
