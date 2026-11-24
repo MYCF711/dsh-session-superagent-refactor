@@ -518,7 +518,11 @@ test('/state 字段契约：client.js 引用的每个字段都必须真的回传
   assert.deepEqual(missingTop, [], '顶层缺字段：' + missingTop.join(', '))
   assert.ok(state.gh !== undefined, 'gh 必须回传')
 
-  const missingPer = [...perWatcher].filter((key) => !(key in watcher))
+  // client 引用的字段里，有些只在特定状态才出现（例：poll 只在轮询停摆时给 ——
+  // 健康态省略它是为了 /state 的体积预算，缺省即健康）。这类字段在这里放行，
+  // 由 contract-stability 的 optional 级登记守名字。
+  const OPTIONAL_PER_WATCHER = new Set(['poll'])
+  const missingPer = [...perWatcher].filter((key) => !OPTIONAL_PER_WATCHER.has(key) && !(key in watcher))
   assert.deepEqual(missingPer, [], '每条缺字段：' + missingPer.join(', '))
 
   await call('POST', '/session-superagent/watch', { action: 'delete', id: created.id })
@@ -859,12 +863,19 @@ test('watch_doctor 能发现"定时器丢了"和"隔离目录不可写"', async 
   const state = mod.__test.readState()
   const key = Object.keys(state.watchers)[0]
   state.watchers[key].lastPoll = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
-  // 进程也跑了很久（否则会被判成「刚重启」，见下一条用例）
-  state.server = { ...(state.server || {}), startedAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString() }
-  mod.__test.writeState(state)
+  // 进程也跑了很久（否则会被判成「刚重启」，见下一条用例）。
+  // 必须连「本进程启动时刻」一起拨：doctor 以进程真实诞生时刻判重启
+  //（盘上 startedAt 在启动挂载失败时根本不刷新，2026-11-22 真机事故）。
+  const restoreBoot = mod.__test.setBootAt(Date.now() - 4 * 60 * 60 * 1000)
+  try {
+    state.server = { ...(state.server || {}), startedAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString() }
+    mod.__test.writeState(state)
 
-  const text = String(await doctor.execute({}))
-  assert.ok(/没轮询过/.test(text), '停滞的守要报出来：' + text.slice(0, 300))
+    const text = String(await doctor.execute({}))
+    assert.ok(/没轮询过/.test(text), '停滞的守要报出来：' + text.slice(0, 300))
+  } finally {
+    restoreBoot()
+  }
 })
 
 test('watch_trace 能说清"被冷却期吸收"，而不是三合一猜测', async () => {
@@ -1144,12 +1155,70 @@ test('刚重启不该被当成「定时器丢了」', async () => {
   assert.ok(fresh.includes('刚重启'), '刚重启要如实说明：' + fresh.slice(0, 300))
   assert.ok(!fresh.includes('定时器可能丢了'), '刚重启不该报故障')
 
-  // 进程已经跑够久（uptime 3 小时）时，同样的陈旧就要报故障
-  const state2 = mod.__test.readState()
-  state2.server = { ...(state2.server || {}), startedAt: new Date(Date.now() - 3 * 3600 * 1000).toISOString() }
-  mod.__test.writeState(state2)
-  const stale = String(await doctor.execute({}))
-  assert.ok(stale.includes('没轮询过'), '跑久了还陈旧才算故障：' + stale.slice(0, 300))
+  // 进程已经跑够久（uptime 3 小时）时，同样的陈旧就要报故障。
+  // 这里必须连「本进程启动时刻」一起往后拨：doctor 现在以**进程真实诞生时刻**判重启
+  //（盘上 server.startedAt 在启动挂载失败时根本不会刷新，2026-11-22 真机事故），
+  // 只改盘上那份的话，uptime 仍是真实的 0 秒、依旧走「刚重启」分支。
+  const restoreBoot = mod.__test.setBootAt(Date.now() - 3 * 3600 * 1000)
+  try {
+    const state2 = mod.__test.readState()
+    state2.server = { ...(state2.server || {}), startedAt: new Date(Date.now() - 3 * 3600 * 1000).toISOString() }
+    mod.__test.writeState(state2)
+    const stale = String(await doctor.execute({}))
+    assert.ok(stale.includes('没轮询过'), '跑久了还陈旧才算故障：' + stale.slice(0, 300))
+  } finally {
+    restoreBoot()
+  }
+})
+
+// 真机事故（2026-11-22）的第二条腿：重启后**一次都没轮询过**时，doctor 现在看不出来。
+// 现场 lastPoll 停在进程启动之前 24 小时，但它既不是「刚重启」（uptime 早超阈值），
+// 也不是「定时器丢了」（那条要 age > staleMs 且 uptime > staleMs，两者都满足时会误报成后者 ——
+// 而真正的原因是启动挂载失败，报「定时器可能丢了」会把人引到错误的方向）。
+test('watch_doctor：重启后还没轮询过要单独报出来（启动挂载失败）', async () => {
+  const tools = []
+  const dir = tempDir('zhuli-bootfail-')
+  process.env.DSH_SUPERAGENT_STATE = dir
+  process.env.DSH_SUPERAGENT_NO_POLL = '1'
+  // 注意：之后一律用**本用例自己的** appliedTools —— 大写的 `tools`（:1157）是本用例内新建的数组，
+  // 而模块级同名变量只装第一次 `apply()` 注册的工具。取错数组会让 doctor 拿到 undefined，
+  // `String(await doctor.execute())` 就变成 "undefined"、断言永远假（2026-11-22 自查抓到）。
+  const appliedTools = []
+  const ctx = {
+    tools: { register: (tool) => appliedTools.push(tool) },
+    webServer: { register: () => () => {} },
+    agents: { get: () => null, currentInitiator: () => ({ id: 'session-bootfail' }) },
+    get: () => null, on() {}, effect: (fn) => fn(), inject: () => {},
+  }
+  const mod = await import('../lib/index.js?bootfail=' + Date.now())
+  mod.apply(ctx)
+  const doctor = appliedTools.find((t) => t.name === 'watch_doctor')
+  assert.ok(doctor, 'watch_doctor 必须被注册')
+  await appliedTools.find((t) => t.name === 'watch_start').execute({ repo: 'acme/bootfail' })
+  // `watch_start` 只排一个 0~5 秒的 boot tick，**第一轮跑完才有 lastPoll**；
+  // 不等它就把旧 lastPoll 写进去，会被随后到达的 persistEntry 合并覆盖（实测踩到）。
+  await sleep(600)
+
+  // 现场形状：进程 10 分钟前启动（已过「刚重启」豁免的 max(3×interval, 5min)），
+  // lastPoll 停在 24 小时前 —— 也就是「重启后一次都没轮询」。
+  // 盘上的 server.startedAt 故意留成两天前：真机事故里那份根本没被刷新，读它会把故障误判成「刚重启」。
+  const bootAt = Date.now() - 10 * 60 * 1000
+  const restoreBoot = mod.__test.setBootAt(bootAt)
+  try {
+    const state = mod.__test.readState()
+    const key = Object.keys(state.watchers)[0]
+    state.watchers[key].lastPoll = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+    state.server = { ...(state.server || {}), startedAt: new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString() }
+    mod.__test.writeState(state)
+
+    const text = String(await doctor.execute({}))
+    assert.ok(text.includes('重启后还没轮询过'),
+      '重启后 lastPoll 早于本进程启动时刻、且已过豁免期，必须明确报「启动挂载可能失败」：' + text.slice(0, 400))
+    assert.ok(!text.includes('刚重启'), '已经过了豁免期，不能说刚重启：' + text.slice(0, 400))
+    assert.ok(!text.includes('定时器可能丢了'), '真因是启动挂载失败，不能误导成「定时器丢了」：' + text.slice(0, 400))
+  } finally {
+    restoreBoot()
+  }
 })
 
 test('watch_trace 文本：一切正常时一行说完，异常才展开', async () => {
@@ -2106,4 +2175,385 @@ test('POST /watch resume：离线开关生效，人工补跑也要挡住（revie
   if (previousNoPoll === undefined) delete process.env.DSH_SUPERAGENT_NO_POLL
   else process.env.DSH_SUPERAGENT_NO_POLL = previousNoPoll
   await call('POST', '/session-superagent/watch', { action: 'delete', id })
+})
+
+// ─── 重启后自动挂载（真机事故 2026-11-22）────────────────────────────────
+//
+// 现场：宿主 11-21 23:11 重启，之后 24 小时里三条守一次都没轮询。
+// 根因在 `apply()` 启动段：`for (const entry of ...) startWatcher(state.watchers[id])`
+// —— 循环变量叫 `entry`，`id` 这个变量在作用域里根本不存在，于是
+// `state.watchers[undefined]` = undefined，`startWatcher(undefined)` 在
+// `timers.has(entry.id)` 处抛 TypeError，被外层 `try {} catch {}` 吞掉：
+// **重启后一条守都不挂，而且没有任何报错**，面板照旧显示「运行中 · 正常」。
+
+test('重启后必须把 enabled 的守重新挂上定时器（启动段的 id 笔误）', async () => {
+  assertTempStateDir('apply 启动挂载')
+  // 造一份「宿主重启过的」状态：一组已存在的守，其中 enabled 的必须被重新挂上
+  const bootDir = tempDir('zhuli-boot-')
+  const previousState = process.env.DSH_SUPERAGENT_STATE
+  const previousNoPoll = process.env.DSH_SUPERAGENT_NO_POLL
+  process.env.DSH_SUPERAGENT_STATE = bootDir
+  delete process.env.DSH_SUPERAGENT_NO_POLL
+  process.env.DSH_SUPERAGENT_OFFLINE = '1'
+  try {
+    const bootState = {
+      schemaVersion: 1,
+      watchers: {
+        'o/live#session-boot': { id: 'o/live#session-boot', repo: 'o/live', provider: 'github', sessionId: 'session-boot', enabled: true, intervalSec: 60 },
+        'o/paused#session-boot': { id: 'o/paused#session-boot', repo: 'o/paused', provider: 'github', sessionId: 'session-boot', enabled: false, intervalSec: 60 },
+        'pr:o/live-pr#session-boot': { id: 'pr:o/live-pr#session-boot', repo: 'o/live-pr', provider: 'github', sessionId: 'session-boot', enabled: true, intervalSec: 60, kind: 'pr' },
+      },
+    }
+    writeFileSync(join(bootDir, 'watchers.json'), JSON.stringify(bootState, null, 1))
+
+    // 模拟宿主重启：新进程里重新 import 一份模块再 apply()。
+    // query 换掉只是为了拿到一份全新的模块实例（模块级 __test 探测要指向它）。
+    const fresh = await import('../lib/index.js?boot=' + Date.now())
+    const bootTools = []
+    fresh.apply({
+      tools: { register: (tool) => bootTools.push(tool) },
+      // 不注册 webServer：启动挂载与路由无关，挂不挂都得把守挂上
+      agents: { currentInitiator: () => ({ id: 'session-boot' }), get: () => null },
+      get: () => null,
+      effect: (fn) => fn(),
+      inject: () => {},
+    })
+
+    // 肯定式断言：enabled 的守必须有 interval 定时器。
+    // 反之（被 TypeError 吞掉时）三条都读 false —— 这就是真机现场。
+    assert.equal(fresh.__test.watchTimerPending('o/live#session-boot'), true,
+      '重启后 enabled 的守必须自动重新挂上，否则宿主一重启轮询就永久停摆')
+    assert.equal(fresh.__test.watchTimerPending('pr:o/live-pr#session-boot'), true,
+      'PR 守同样必须在重启后自动重新挂上')
+    // 否定式断言：暂停的守不该被挂（否则「暂停」在重启后就失效了）
+    assert.equal(fresh.__test.watchTimerPending('o/paused#session-boot'), false,
+      '暂停的守重启后不该被挂上定时器')
+
+    // 收尾：这些定时器指着临时目录，不能留在进程里跨用例
+    for (const id of ['o/live#session-boot', 'pr:o/live-pr#session-boot']) {
+      fresh.__test.stopWatchTimerForTest?.(id)
+    }
+  } finally {
+    if (previousState === undefined) delete process.env.DSH_SUPERAGENT_STATE
+    else process.env.DSH_SUPERAGENT_STATE = previousState
+    if (previousNoPoll === undefined) delete process.env.DSH_SUPERAGENT_NO_POLL
+    else process.env.DSH_SUPERAGENT_NO_POLL = previousNoPoll
+    delete process.env.DSH_SUPERAGENT_OFFLINE
+  }
+})
+
+// ─── PR 守：会话缺失必须走宽限期，不能立刻报错 ────────────────────────────
+//
+// 真机事故（2026-11-23）：`pr:MYCF711/dsh-session-superagent` 这条守所在会话
+// 只是**休眠**了（panel 里还在、标题是「监控对外pr」），宿主重启后 agents.get()
+// 拿不到它 —— issue 守有 `sessionMissingVerdict` 的 10 分钟宽限期，
+// **PR 守没有**：它直接把 wake 的 reason 写成 `lastError` 并 `bumpFailure`，
+// 面板立刻显示红色「异常」+「退避 459s」，用户以为守坏了。
+//
+// 判据：会话暂时不可见时应当「等待」而不是「报错」；只有连续超过宽限期
+// 才升级成错误（那才是「会话真的没了」）。
+test('PR 守：会话暂时不在宿主里时走宽限期，不立刻标成异常', async () => {
+  assertTempStateDir('PR 守会话宽限')
+  const dir = tempDir('zhuli-prgrace-')
+  const previousState = process.env.DSH_SUPERAGENT_STATE
+  const previousNoPoll = process.env.DSH_SUPERAGENT_NO_POLL
+  process.env.DSH_SUPERAGENT_STATE = dir
+  delete process.env.DSH_SUPERAGENT_NO_POLL
+  try {
+    const mod = await import('../lib/index.js?prgrace=' + Date.now())
+    const entry = {
+      id: 'pr:o/grace#session-grace',
+      repo: 'o/grace',
+      provider: 'github',
+      sessionId: 'session-grace',
+      kind: 'pr',
+      enabled: true,
+      intervalSec: 60,
+      // 一条“有评论的外来 PR”，保证这一轮真的会产生唤醒意图
+      seenComments: {},
+    }
+    mod.__test.writeState({ schemaVersion: 1, watchers: { [entry.id]: entry } })
+
+    // 会话不存在（宿主重启后休眠会话的典型形状）
+    const ctx = { agents: { get: () => undefined, currentInitiator: () => ({ id: 'session-grace' }) } }
+    // gh 返回一个外来 fork PR 带一条他人评论。
+    // 必须按**路径**分流：PR 列表走 graphql，评论走 REST issues/N/comments
+    // （seenId=0 时 pollPrOnce 会去 fetchAllIssueComments）。两者返回形状不同，
+    // 统一返回 GraphQL 形状会让评论解析失败 → 静默 continue → 用例变成空转（实测踩到）。
+    const prListBody = JSON.stringify({
+      data: {
+        search: {
+          pageInfo: { hasNextPage: false },
+          nodes: [{
+            number: 136,
+            title: 't',
+            state: 'OPEN',
+            isDraft: false,
+            createdAt: '2026-11-20T00:00:00Z',
+            updatedAt: '2026-11-21T14:34:59Z',
+            url: 'https://github.com/o/grace/pull/136',
+            author: { login: 'stranger' },
+            labels: { nodes: [] },
+            assignees: { nodes: [] },
+            headRepository: { nameWithOwner: 'stranger/grace' },
+            baseRepository: { nameWithOwner: 'o/grace' },
+            comments: { nodes: [] },
+          }],
+        },
+      },
+    })
+    const commentBody = JSON.stringify([
+      { id: 7001, body: 'LGTM', created_at: '2026-11-21T14:34:59Z', user: { login: 'stranger' } },
+    ])
+    const ghRun = async (file, argv) => ({
+      code: 0,
+      stdout: String((argv || []).join(' ')).includes('/comments') ? commentBody : prListBody,
+      stderr: '',
+    })
+    const wakes = []
+    // wakeFn 如实模拟 `wake()` 在会话不存在时的返回
+    const wakeFn = (c, sessionId, text, onSettled) => {
+      wakes.push(sessionId)
+      onSettled({ ok: false, reason: '这个会话已经不在宿主里了 —— 宿主重启过，或这个会话被关掉了；面板里刷新一下，还在就重建这条主理鱼' })
+      return { ok: true, merged: true, pending: 1 }
+    }
+
+    // selfLogin 必须注入：否则会去跑真实的 `gh api user`（单测里会变成 60 秒超时）
+    await mod.__test.pollPrOnce(ctx, entry, 60_000, null, { ghRun, wake: wakeFn, selfLogin: 'me' })
+    await sleep(60)
+
+    const stored = mod.__test.readState().watchers[entry.id]
+    // 正向：确实尝试过唤醒（否则这条用例是空转）
+    assert.deepEqual(wakes, ['session-grace'], '这一轮应当尝试过唤醒，否则用例空转：' + JSON.stringify(wakes))
+    // 核心断言：首轮**不能**升级成 lastError
+    assert.equal(stored.lastError, null,
+      '会话暂时不可见的首轮不该写成异常：' + String(stored.lastError))
+    assert.equal(Number(stored.consecutiveFailures) || 0, 0,
+      '宽限期内不该累计失败次数（那会触发退避，用户看到「退避 459s」）')
+    assert.equal(stored.nextAt, null, '宽限期内不该安排退避')
+    assert.match(String(stored.lastDeferred || ''), /会话|宽限|就绪/,
+      '应当像 issue 守那样如实说明「会话还没就绪」：' + String(stored.lastDeferred))
+    // 宽限期的起点要记下来，下一轮才能算「等了多久」
+    assert.ok(stored.sessionMissingSince, '必须记下会话缺失的起始时刻，否则永远算不出等了多久')
+  } finally {
+    if (previousState === undefined) delete process.env.DSH_SUPERAGENT_STATE
+    else process.env.DSH_SUPERAGENT_STATE = previousState
+    if (previousNoPoll === undefined) delete process.env.DSH_SUPERAGENT_NO_POLL
+    else process.env.DSH_SUPERAGENT_NO_POLL = previousNoPoll
+  }
+})
+
+// 反向用例：宽限期结束后必须真的报错 —— 否则「会话早就被删了」会被无限期当成
+// 「宿主刚启动，再等等」，客户永远等不到一条有用的提示。与上面那条配对。
+test('PR 守：会话超过宽限期仍找不到时，必须升级成错误', async () => {
+  assertTempStateDir('PR 守会话宽限到期')
+  const dir = tempDir('zhuli-prgrace2-')
+  const previousState = process.env.DSH_SUPERAGENT_STATE
+  const previousNoPoll = process.env.DSH_SUPERAGENT_NO_POLL
+  process.env.DSH_SUPERAGENT_STATE = dir
+  delete process.env.DSH_SUPERAGENT_NO_POLL
+  try {
+    const mod = await import('../lib/index.js?prgrace2=' + Date.now())
+    const { SESSION_MISSING_GRACE_MS } = await import('../lib/watch.js')
+    const entry = {
+      id: 'pr:o/gone#session-gone',
+      repo: 'o/gone',
+      provider: 'github',
+      sessionId: 'session-gone',
+      kind: 'pr',
+      enabled: true,
+      intervalSec: 60,
+      seenComments: {},
+      // 缺陷现场：超过宽限期仍未找到
+      sessionMissingSince: new Date(Date.now() - SESSION_MISSING_GRACE_MS - 5 * 60 * 1000).toISOString(),
+    }
+    mod.__test.writeState({ schemaVersion: 1, watchers: { [entry.id]: entry } })
+
+    const ctx = { agents: { get: () => undefined, currentInitiator: () => ({ id: 'session-gone' }) } }
+    const prListBody = JSON.stringify({
+      data: { search: { pageInfo: { hasNextPage: false }, nodes: [{
+        number: 137, title: 't', state: 'OPEN', isDraft: false,
+        createdAt: '2026-11-20T00:00:00Z', updatedAt: '2026-11-21T14:34:59Z',
+        url: 'https://github.com/o/gone/pull/137', author: { login: 'stranger' },
+        labels: { nodes: [] }, assignees: { nodes: [] },
+        headRepository: { nameWithOwner: 'stranger/gone' },
+        baseRepository: { nameWithOwner: 'o/gone' },
+        comments: { nodes: [] },
+      }] } },
+    })
+    const commentBody = JSON.stringify([
+      { id: 7002, body: 'x', created_at: '2026-11-21T14:34:59Z', user: { login: 'stranger' } },
+    ])
+    const ghRun = async (file, argv) => ({
+      code: 0,
+      stdout: String((argv || []).join(' ')).includes('/comments') ? commentBody : prListBody,
+      stderr: '',
+    })
+    const wakeFn = (c, sessionId, text, onSettled) => {
+      onSettled({ ok: false, reason: '这个会话已经不在宿主里了 —— 宿主重启过，或这个会话被关掉了；面板里刷新一下，还在就重建这条主理鱼' })
+      return { ok: true, merged: true, pending: 1 }
+    }
+
+    await mod.__test.pollPrOnce(ctx, entry, 60_000, null, { ghRun, wake: wakeFn, selfLogin: 'me' })
+    await sleep(60)
+
+    const stored = mod.__test.readState().watchers[entry.id]
+    // 否定式断言（不能只靠正则含「会话」—— 宽限文案也含）：
+    // 这里必须是一条**真正的错误**：有 lastError、进入退避、失败计数 +1。
+    assert.match(String(stored.lastError || ''), /会话已不在/,
+      '超过宽限期必须升级成错误：' + String(stored.lastError || stored.lastDeferred))
+    assert.ok(Number(stored.consecutiveFailures) >= 1, '超期失败要计入退避')
+    assert.ok(stored.nextAt, '超期失败要安排退避，别按 interval 无限重试')
+  } finally {
+    if (previousState === undefined) delete process.env.DSH_SUPERAGENT_STATE
+    else process.env.DSH_SUPERAGENT_STATE = previousState
+    if (previousNoPoll === undefined) delete process.env.DSH_SUPERAGENT_NO_POLL
+    else process.env.DSH_SUPERAGENT_NO_POLL = previousNoPoll
+  }
+})
+
+
+// ── 对抗性审计 B 的三条回归（PR #68 backport 后同一判据的其它入口）─────────────
+
+test('watch_doctor：lastPoll 为 null 的老守也要报「重启后还没轮询过」，不能沉默（对抗性审计 B · D3）', async () => {
+  const dir = tempDir('zhuli-doctor-nullpoll-')
+  process.env.DSH_SUPERAGENT_STATE = dir
+  process.env.DSH_SUPERAGENT_NO_POLL = '1'
+  const appliedTools = []
+  const ctx = {
+    tools: { register: (tool) => appliedTools.push(tool) },
+    webServer: { register: () => () => {} },
+    agents: { get: () => null, currentInitiator: () => ({ id: 'session-nullpoll' }) },
+    get: () => null, on() {}, effect: (fn) => fn(), inject: () => {},
+  }
+  const mod = await import('../lib/index.js?nullpoll=' + Date.now())
+  mod.apply(ctx)
+  const doctor = appliedTools.find((t) => t.name === 'watch_doctor')
+  assert.ok(doctor, 'watch_doctor 必须被注册')
+  await appliedTools.find((t) => t.name === 'watch_start').execute({ repo: 'acme/nullpoll' })
+  await sleep(600)
+
+  // 现场形状：进程已跑 10 分钟（过了豁免期），这条守一次都没轮询过（lastPoll=null），
+  // 且建于很久以前 —— 正是「启动挂载失败」后从没跑起来的老守。
+  const bootAt = Date.now() - 10 * 60 * 1000
+  const restoreBoot = mod.__test.setBootAt(bootAt)
+  try {
+    const state = mod.__test.readState()
+    const key = Object.keys(state.watchers)[0]
+    state.watchers[key].lastPoll = null
+    state.watchers[key].createdAt = new Date(Date.now() - 48 * 3600 * 1000).toISOString()
+    state.server = { ...(state.server || {}), startedAt: new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString() }
+    mod.__test.writeState(state)
+
+    const text = String(await doctor.execute({}))
+    assert.ok(text.includes('重启后还没轮询过'),
+      'lastPoll=null 的老守必须报「重启后还没轮询过」；以前整段检查挂在「&& entry.lastPoll」上，'
+      + '这条直接沉默、结尾还写「正常」，与同一份 /state 的 poll=boot-miss 方向相反：' + text.slice(0, 500))
+    assert.ok(!text.includes('定时器可能丢了'), '真因是启动挂载失败，不能误导成「定时器丢了」：' + text.slice(0, 500))
+  } finally {
+    restoreBoot()
+  }
+})
+
+test('watch_status 文本：活跃时段外 / 退避中不得报「N 分钟没轮询」（对抗性审计 B · D2）', async () => {
+  const dir = tempDir('zhuli-status-waiting-')
+  process.env.DSH_SUPERAGENT_STATE = dir
+  process.env.DSH_SUPERAGENT_NO_POLL = '1'
+  const tools = []
+  const ctx = {
+    tools: { register: (tool) => tools.push(tool) },
+    webServer: { register: () => () => {} },
+    agents: { get: () => null, currentInitiator: () => ({ id: 'session-waiting' }) },
+    get: () => null, on() {}, effect: (fn) => fn(), inject: () => {},
+  }
+  const mod = await import('../lib/index.js?statuswait=' + Date.now())
+  mod.apply(ctx)
+  const status = tools.find((t) => t.name === 'watch_status')
+  assert.ok(status, 'watch_status 必须被注册')
+
+  // 构造一个「当前一定在窗口外」的活跃时段：从当前小时 +2 起两小时。
+  const hour = new Date().getHours()
+  const pad = (n) => String((n + 24) % 24).padStart(2, '0')
+  const activeHours = pad(hour + 2) + ':00-' + pad(hour + 3) + ':00'
+
+  const entryId = 'acme/waiting#session-waiting'
+  mod.__test.writeState({
+    schemaVersion: 1,
+    watchers: {
+      [entryId]: {
+        id: entryId, repo: 'acme/waiting', provider: 'github', sessionId: 'session-waiting',
+        kind: 'issue', enabled: true, intervalSec: 60, activeHours,
+        // 一小时没轮询：在时段外这是设计如此，不是故障
+        lastPoll: new Date(Date.now() - 3600 * 1000).toISOString(),
+        createdAt: new Date(Date.now() - 72 * 3600 * 1000).toISOString(),
+        seen: {},
+      },
+    },
+  })
+
+  const text = String(await status.execute({}))
+  assert.ok(!/分钟没轮询/.test(text),
+    '活跃时段外的守不该被说成「已 N 分钟没轮询」—— 同一份数据 /state 是 waiting/active-hours、面板是「时段外」：' + text.slice(0, 500))
+  // JSON 通道同样不该冒出停摆字段（waiting 不在 STOPPED_STATES 里）
+  const json = JSON.parse(String(await status.execute({ format: 'json' })))
+  assert.ok(!('poll' in json.watchers[0]), '时段外不属于停摆，JSON 不该带 poll：' + JSON.stringify(json.watchers[0]).slice(0, 300))
+})
+
+test('PR 守：会话恢复后必须清掉缺失起点，第二次缺失仍走宽限期（对抗性审计 B · D1）', async () => {
+  const dir = tempDir('zhuli-pr-revive-')
+  const previousState = process.env.DSH_SUPERAGENT_STATE
+  const previousNoPoll = process.env.DSH_SUPERAGENT_NO_POLL
+  process.env.DSH_SUPERAGENT_STATE = dir
+  delete process.env.DSH_SUPERAGENT_NO_POLL
+  try {
+    const mod = await import('../lib/index.js?prrevive=' + Date.now())
+    const { SESSION_MISSING_GRACE_MS } = await import('../lib/watch.js')
+    const entry = {
+      id: 'pr:o/revive#session-revive',
+      repo: 'o/revive', provider: 'github', sessionId: 'session-revive', kind: 'pr',
+      enabled: true, intervalSec: 60, seenComments: {},
+      // 上一幕：会话缺失已超过宽限期（已经写进 lastError / 失败计数）
+      sessionMissingSince: new Date(Date.now() - SESSION_MISSING_GRACE_MS - 5 * 60 * 1000).toISOString(),
+    }
+    mod.__test.writeState({ schemaVersion: 1, watchers: { [entry.id]: entry } })
+
+    let commentId = 8001
+    const ghRun = async (file, argv) => ({
+      code: 0,
+      stdout: String((argv || []).join(' ')).includes('/comments')
+        ? JSON.stringify([{ id: commentId, body: 'c', created_at: '2026-11-21T14:34:59Z', user: { login: 'stranger' } }])
+        : JSON.stringify({ data: { search: { pageInfo: { hasNextPage: false }, nodes: [{
+          number: 200, title: 't', state: 'OPEN', isDraft: false,
+          createdAt: '2026-11-20T00:00:00Z', updatedAt: '2026-11-21T14:34:59Z',
+          url: 'https://github.com/o/revive/pull/200', author: { login: 'stranger' },
+          labels: { nodes: [] }, assignees: { nodes: [] },
+          headRepository: { nameWithOwner: 'stranger/revive' },
+          baseRepository: { nameWithOwner: 'o/revive' },
+          comments: { nodes: [] },
+        }] } } }),
+      stderr: '',
+    })
+    const ctx = { agents: { get: () => ({ status: 'idle' }), currentInitiator: () => ({ id: 'session-revive' }) } }
+
+    // 第二幕：会话回来了，唤醒成功
+    const okWake = (c, sessionId, text, onSettled) => { onSettled({ ok: true }); return { ok: true, merged: false } }
+    await mod.__test.pollPrOnce(ctx, entry, 60_000, null, { ghRun, wake: okWake, selfLogin: 'me' })
+    await sleep(60)
+    const afterOk = mod.__test.readState().watchers[entry.id]
+    assert.equal(afterOk.sessionMissingSince, null,
+      '唤醒成功必须清掉 sessionMissingSince；否则下一次缺失会拿上一次的旧起点直接判 grace:false，'
+      + '立刻红并进入退避，文案还写「连续 60 分钟找不到」')
+
+    // 第三幕（纯函数级）：起点清空后再次缺失，必须回到宽限期，而不是拿着旧起点直接判超期。
+    // 真实 pollPrOnce 的「再次缺失」时序已由上面的「首轮宽限」用例覆盖（首轮就等于起点为空）；
+    // 这里钉的是 D1 的核心：**成功路径必须把起点清掉**，否则下一次缺失会以旧起点算起。
+    const { sessionMissingVerdict } = await import('../lib/watch.js')
+    assert.equal(sessionMissingVerdict({ missingSince: afterOk.sessionMissingSince }).grace, true,
+      '起点为空时必须走宽限期（justNow），否则第二次缺失会立刻红并进入退避')
+  } finally {
+    if (previousState === undefined) delete process.env.DSH_SUPERAGENT_STATE
+    else process.env.DSH_SUPERAGENT_STATE = previousState
+    if (previousNoPoll === undefined) delete process.env.DSH_SUPERAGENT_NO_POLL
+    else process.env.DSH_SUPERAGENT_NO_POLL = previousNoPoll
+  }
 })
